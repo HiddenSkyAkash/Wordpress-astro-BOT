@@ -10,7 +10,7 @@ const FROM_EMAIL = 'aaron.demski@demskigroupdev.com';
 
 const LEAD_FIELDS = [
   'intent', 'intent_detail', 'budget', 'project_notes',
-  'name', 'phone', 'email', 'cta_choice',
+  'name', 'phone', 'email', 'company', 'cta_choice',
   'page', 'page_name',
   'utm_source', 'utm_campaign', 'utm_medium', 'utm_term', 'utm_content', 'gclid',
 ];

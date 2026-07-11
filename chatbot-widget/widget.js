@@ -63,6 +63,13 @@
     'Digital marketing help':    ['Increase Website Traffic', 'Generate More Leads', 'Social Media Growth', 'Paid Advertising', 'Other'],
     'Just exploring':            ['Planning a Future Project', 'Comparing Vendors', 'Learning About Tech', 'Just Curious']
   };
+  var BUDGET_OPTIONS = ['Under $10k', '$10k - $25k', '$25k - $50k', '$50k+', 'Not sure yet'];
+  var INTENT_DETAIL_FOLLOWUPS = {
+    'New startup or app idea':  'Love it! Tell me more, what kind of app or product are you thinking about?',
+    'Software for my business': 'Great! What problem are you trying to solve in your business?',
+    'Digital marketing help':   'Nice! What are you hoping to improve: traffic, leads, or sales?',
+    'Just exploring':           "That's totally fine! Can you tell me a bit about what you have in mind?"
+  };
 
   var AV_STYLE =
     'width:34px!important;height:34px!important;min-width:34px!important;' +
@@ -85,6 +92,127 @@
     'border-radius:18px 18px 4px 18px!important;align-self:flex-end!important;' +
     'max-width:76%!important;font-size:13.5px!important;line-height:1.55!important;' +
     'box-shadow:0 4px 14px rgba(1,84,177,0.25)!important;display:block!important;word-break:break-word!important;';
+
+  /* ── SMART TEASER MESSAGES ──
+   * Message pools + selection logic for the small floating teaser/idle
+   * bubble (.cb-teaser-bubble). Kept outside init() since none of this
+   * needs live chat DOM/state (page type, localStorage-backed rotation
+   * memory) — the one exception, pickIdleBubbleMessage (needs `lead`/
+   * `step`), lives inside init() instead, right where those are in scope.
+   * Everything here only changes WHICH string the existing bubble
+   * mechanism displays and WHEN — the triggers/timing themselves
+   * (card → bubble → badge → auto-open, the idle-reminder cadence) are
+   * untouched; so is every backend/API/session/state-machine concern. */
+
+  // Bot-message text is never trusted directly into innerHTML anywhere in
+  // this file (see buildBotMsgBubble's own comment) — the same rule
+  // applies here, since a "remembered topic" can trace back to free-typed
+  // text a visitor once typed as their intent_detail (lead.intent_detail
+  // falls back to raw user input when it doesn't match a canonical
+  // option). A plain string like "Mobile App" round-trips through this
+  // untouched; something like "<img src=x onerror=...>" comes out inert.
+  function escapeHtml(str) {
+    var div = document.createElement('div');
+    div.textContent = str == null ? '' : String(str);
+    return div.innerHTML;
+  }
+
+  function detectPageType() {
+    var override = scriptAttr('data-page-type', '');
+    if (override) return override;
+    var path = (location.pathname || '').toLowerCase();
+    if (/pricing|consult|contact/.test(path)) return 'pricing';
+    if (/case-stud|portfolio|our-work|success-stor/.test(path)) return 'case-study';
+    if (/service/.test(path)) return 'service';
+    return 'home';
+  }
+
+  var TEASER_MESSAGES = {
+    home: [
+      'Hey! Do you have any questions?',
+      'Have questions about your next software project?',
+      'I can help you explore ideas.',
+      'Need help choosing the right solution?',
+      'Planning custom software?',
+      'Looking for AI automation?'
+    ],
+    service: [
+      'I can explain how this service works.',
+      'Want a quick estimate?',
+      "Not sure if this solution fits? Happy to help.",
+      'I can answer technical questions.'
+    ],
+    'case-study': [
+      'Want to see similar projects?',
+      'I can recommend relevant case studies.',
+      'Curious how this solution was built?'
+    ],
+    pricing: [
+      'Need help estimating project cost?',
+      'I can explain our process.'
+    ]
+  };
+
+  var TEASER_MEMORY_KEY = 'cb_teaser_memory_v1';
+  var TEASER_LAST_KEY = 'cb_teaser_last_v1';
+  var TEASER_TOPIC_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days — an older remembered topic is treated as stale rather than referenced as if it were current
+
+  function loadTeaserMemory() {
+    try { return JSON.parse(localStorage.getItem(TEASER_MEMORY_KEY) || 'null'); } catch (e) { return null; }
+  }
+  function saveTeaserMemory(patch) {
+    try {
+      var current = loadTeaserMemory() || {};
+      localStorage.setItem(TEASER_MEMORY_KEY, JSON.stringify(Object.assign(current, patch)));
+    } catch (e) { /* localStorage unavailable — teaser just falls back to page-type copy */ }
+  }
+
+  // Captured once, before this page load marks itself as a visit, so a
+  // first-time visitor is never mistaken for a returning one within their
+  // own first session (order matters: read, THEN write).
+  var WAS_RETURNING_VISITOR = !!(loadTeaserMemory() && loadTeaserMemory().hasVisitedBefore);
+  saveTeaserMemory({ hasVisitedBefore: true });
+
+  /* Picks a random entry from `pool`, avoiding an exact repeat of whatever
+   * was last shown under the same `categoryKey` (persisted across page
+   * loads via TEASER_LAST_KEY) — "don't show the same teaser twice in a
+   * short period" without needing time-based expiry to reason about. */
+  function pickVaried(pool, categoryKey) {
+    if (!pool || !pool.length) return '';
+    if (pool.length === 1) return pool[0];
+    var lastMap;
+    try { lastMap = JSON.parse(localStorage.getItem(TEASER_LAST_KEY) || '{}'); } catch (e) { lastMap = {}; }
+    var lastText = lastMap[categoryKey];
+    var candidates = pool.filter(function (m) { return m !== lastText; });
+    var chosen = candidates[Math.floor(Math.random() * candidates.length)];
+    lastMap[categoryKey] = chosen;
+    try { localStorage.setItem(TEASER_LAST_KEY, JSON.stringify(lastMap)); } catch (e) {}
+    return chosen;
+  }
+
+  /* The pre-conversation teaser bubble's message: prefers a remembered
+   * topic from a past visit ("still thinking about X?"), then a general
+   * returning-visitor welcome, then falls back to a page-type-aware pool
+   * matched against the current URL (or an explicit data-page-type
+   * override on the loader/widget script tag). */
+  function pickTeaserMessage() {
+    var memory = loadTeaserMemory();
+    if (memory && memory.lastTopic && memory.topicSavedAt && (Date.now() - memory.topicSavedAt) < TEASER_TOPIC_MAX_AGE_MS) {
+      return pickVaried([
+        'Ready to continue planning your ' + memory.lastTopic + '?',
+        'Still thinking about ' + memory.lastTopic + '?',
+        'Want to pick back up on your ' + memory.lastTopic + ' project?'
+      ], 'topic');
+    }
+    if (WAS_RETURNING_VISITOR) {
+      return pickVaried([
+        'Welcome back! Want to continue where we left off?',
+        "Welcome back, I'm here if you have more questions."
+      ], 'returning');
+    }
+    var pageType = detectPageType();
+    return pickVaried(TEASER_MESSAGES[pageType] || TEASER_MESSAGES.home, pageType);
+  }
 
   /* ── STATE ── */
   var step = 0;
@@ -143,8 +271,15 @@
     utm_medium: fp.utm_medium || '', utm_term: fp.utm_term || '',
     utm_content: fp.utm_content || '', gclid: fp.gclid || '',
     intent: '', intent_detail: '', budget: '', project_notes: '',
-    name: '', phone: '', email: '', cta_choice: ''
+    name: '', phone: '', email: '', company: '', cta_choice: ''
   };
+
+  /* Medium-confidence project-type/budget hints (see api/chat.js's
+   * formatTurnSignalInstructions) — never locked into `lead`, never sent to
+   * submitLead, only threaded back into the next relevant stepContext so
+   * the AI can softly confirm rather than asking cold or silently dropping
+   * what the visitor already half-said. Cleared once the real field lands. */
+  var tentativeHints = { intent: '', budget: '' };
 
   /* ── SOUND ──
    * <audio> element with inline base64 WAV. Browsers allow .play() from
@@ -198,33 +333,33 @@
     + '@keyframes cb-badge-pop{from{transform:scale(0);}to{transform:scale(1);}}'
     + '#bot-launcher.cb-shake{animation:cb-shake 2s ease-in-out 0s 1;}'
     + '@keyframes cb-shake{0%,100%{transform:translateY(0) scale(1) translateX(0) rotate(0);}5%{transform:translateY(0) scale(1) translateX(-6px) rotate(-4deg);}10%{transform:translateY(0) scale(1) translateX(6px) rotate(4deg);}15%{transform:translateY(0) scale(1) translateX(-6px) rotate(-4deg);}20%{transform:translateY(0) scale(1) translateX(6px) rotate(4deg);}25%{transform:translateY(0) scale(1) translateX(-6px) rotate(-4deg);}30%{transform:translateY(0) scale(1) translateX(6px) rotate(4deg);}35%{transform:translateY(0) scale(1) translateX(-5px) rotate(-3deg);}40%{transform:translateY(0) scale(1) translateX(5px) rotate(3deg);}45%{transform:translateY(0) scale(1) translateX(-4px) rotate(-2deg);}50%{transform:translateY(0) scale(1) translateX(4px) rotate(2deg);}55%{transform:translateY(0) scale(1) translateX(-3px) rotate(-2deg);}60%{transform:translateY(0) scale(1) translateX(3px) rotate(2deg);}65%{transform:translateY(0) scale(1) translateX(-2px) rotate(-1deg);}70%{transform:translateY(0) scale(1) translateX(2px) rotate(1deg);}75%,100%{transform:translateY(0) scale(1) translateX(0) rotate(0);}}'
-    + '.cb-teaser-bubble{position:fixed;bottom:66px;right:162px;z-index:2147483646;background:#fff;border:2px solid #0154B1;border-radius:18px 18px 18px 4px;box-shadow:0 12px 40px rgba(0,0,0,0.16);padding:12px 16px;max-width:240px;font-family:"Outfit",sans-serif;opacity:0;transform:translateX(10px) scale(.94);transition:opacity .3s,transform .3s;pointer-events:none;display:flex;align-items:center;gap:10px;box-sizing:border-box;}'
+    + '.cb-teaser-bubble{position:fixed;bottom:66px;right:162px;z-index:2147483646;background:#fff;border:2px solid #0154B1;border-radius:18px 18px 18px 4px;box-shadow:0 12px 40px rgba(0,0,0,0.16);padding:12px 16px;max-width:270px;font-family:"Outfit",sans-serif;opacity:0;transform:translateX(10px) scale(.94);transition:opacity .3s,transform .3s;pointer-events:none;display:flex;align-items:center;gap:10px;box-sizing:border-box;}'
     + '.cb-teaser-bubble.cb-bv{opacity:1;transform:none;pointer-events:all;}'
     + '.cb-teaser-bubble.cb-bh{opacity:0;transform:translateX(10px) scale(.94);pointer-events:none;}'
     + '.cb-teaser-bubble p{font-size:14px;color:#222;margin:0;line-height:1.4;font-weight:600;flex:1;cursor:pointer;}'
     + '.cb-teaser-bubble .cb-bubble-av{width:38px;height:38px;border-radius:50%;object-fit:cover;flex-shrink:0;border:2px solid #fff;box-shadow:0 0 0 2px #0154B1;}'
     + '.cb-bubble-close{position:absolute;top:6px;right:8px;font-size:15px;color:#ccc;cursor:pointer;line-height:1;}'
     + '.cb-bubble-close:hover{color:#666;}'
-    + '#cb-greeting-card{position:fixed;bottom:40px;right:40px;z-index:2147483647;background:#fff;border:2px solid #0154B1;border-radius:20px;box-shadow:0 20px 60px rgba(0,0,0,0.18);padding:18px 20px 20px;width:360px;font-family:"Outfit",sans-serif;opacity:0;transform:translateY(16px) scale(.95);transition:opacity .32s,transform .32s;pointer-events:none;box-sizing:border-box;}'
+    + '#cb-greeting-card{position:fixed;bottom:40px;right:40px;z-index:2147483647;background:#fff;border:2px solid #0154B1;border-radius:23px;box-shadow:0 23px 69px rgba(0,0,0,0.18);padding:21px 23px 23px;width:414px;font-family:"Outfit",sans-serif;opacity:0;transform:translateY(16px) scale(.95);transition:opacity .32s,transform .32s;pointer-events:none;box-sizing:border-box;}'
     + '#cb-greeting-card.cb-gv{opacity:1;transform:none;pointer-events:all;}'
     + '#cb-greeting-card.cb-gh{opacity:0;transform:translateY(16px) scale(.95);pointer-events:none;}'
-    + '.cb-gc-head{display:flex;align-items:flex-start;gap:10px;margin-bottom:14px;}'
+    + '.cb-gc-head{display:flex;align-items:flex-start;gap:12px;margin-bottom:16px;}'
     + '.cb-gc-av-wrap{position:relative;flex-shrink:0;}'
-    + '.cb-gc-av-wrap img{width:53px;height:53px;border-radius:50%;object-fit:cover;display:block;}'
+    + '.cb-gc-av-wrap img{width:61px;height:61px;border-radius:50%;object-fit:cover;display:block;}'
     + '.cb-gc-av-wrap::before{content:"";position:absolute;inset:-2px;border-radius:50%;background:linear-gradient(135deg,#0154B1,#4facfe);z-index:-1;}'
-    + '.cb-gc-online{position:absolute;bottom:-1px;right:-1px;width:11px;height:11px;background:#22c55e;border-radius:50%;border:2px solid #fff;}'
-    + '.cb-gc-name{font-size:15px;font-weight:700;color:#111;}'
-    + '.cb-gc-time{font-size:11.5px;color:#9aa1ad;margin-top:1px;}'
-    + '.cb-gc-close{margin-left:auto;font-size:18px;color:#bbb;cursor:pointer;line-height:1;padding:2px;}'
+    + '.cb-gc-online{position:absolute;bottom:-1px;right:-1px;width:13px;height:13px;background:#22c55e;border-radius:50%;border:2px solid #fff;}'
+    + '.cb-gc-name{font-size:17px;font-weight:700;color:#111;}'
+    + '.cb-gc-time{font-size:13px;color:#9aa1ad;margin-top:1px;}'
+    + '.cb-gc-close{margin-left:auto;font-size:27px;color:#bbb;cursor:pointer;line-height:1;padding:2px;}'
     + '.cb-gc-close:hover{color:#666;}'
-    + '.cb-gc-question{font-size:15px;font-weight:600;color:#1a1d23;line-height:1.4;margin:0 0 14px;}'
-    + '.cb-gc-yn{display:flex;gap:10px;margin-bottom:14px;}'
-    + '.cb-gc-yn button{flex:1;background:#eaf3fe;color:#0154B1;border:none;padding:10px 0;border-radius:12px;font-size:13.5px;font-weight:600;cursor:pointer;font-family:"Outfit",sans-serif;transition:background .18s;}'
+    + '.cb-gc-question{font-size:17px;font-weight:600;color:#1a1d23;line-height:1.4;margin:0 0 16px;}'
+    + '.cb-gc-yn{display:flex;gap:12px;margin-bottom:16px;}'
+    + '.cb-gc-yn button{flex:1;background:#eaf3fe;color:#0154B1;border:none;padding:12px 0;border-radius:14px;font-size:15.5px;font-weight:600;cursor:pointer;font-family:"Outfit",sans-serif;transition:background .18s;}'
     + '.cb-gc-yn button:hover{background:#0154B1;color:#fff;}'
-    + '.cb-gc-input{display:flex;align-items:center;border:1.5px solid #e7eaf0;border-radius:24px;padding:6px 6px 6px 16px;}'
-    + '.cb-gc-input input{flex:1;border:none;outline:none;font-size:13.5px;font-family:"Outfit",sans-serif;color:#111;background:transparent;}'
+    + '.cb-gc-input{display:flex;align-items:center;border:1.5px solid #e7eaf0;border-radius:28px;padding:7px 7px 7px 18px;}'
+    + '.cb-gc-input input{flex:1;border:none;outline:none;font-size:15.5px;font-family:"Outfit",sans-serif;color:#111;background:transparent;}'
     + '.cb-gc-input input::placeholder{color:#6b7078;}'
-    + '.cb-gc-input button{width:32px;height:32px;border-radius:50%;background:#f0f3f8;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;color:#0154B1;transition:background .18s;}'
+    + '.cb-gc-input button{width:37px;height:37px;border-radius:50%;background:#f0f3f8;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;color:#0154B1;transition:background .18s;}'
     + '.cb-gc-input button:hover{background:#0154B1;color:#fff;}'
     + '#lead-bot{position:fixed;bottom:24px;right:24px;z-index:2147483646;padding:3px;border-radius:25px;background:transparent;box-shadow:0 32px 80px rgba(0,0,0,0.16);animation:cb-pop-in .35s cubic-bezier(.34,1.56,.64,1) both;}'
     + '#lead-bot::before{content:"";position:absolute;inset:0;border-radius:25px;padding:3px;background:linear-gradient(135deg,#0154B1,#4facfe,#7b5cff,#0154B1);background-size:300% 300%;animation:cb-border-flow 6s ease infinite;-webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);-webkit-mask-composite:xor;mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);mask-composite:exclude;pointer-events:none;z-index:1;}'
@@ -476,12 +611,20 @@
         localStorage.setItem(SESSION_KEY, JSON.stringify({
           step: step,
           lead: lead,
+          tentativeHints: tentativeHints,
           chatHistory: chatHistory,
           transcript: transcript,
           conversationStarted: conversationStarted,
           savedAt: Date.now()
         }));
       } catch (e) { /* localStorage unavailable (private mode, quota) — degrade silently, in-memory state still works for this page load */ }
+      /* Separate, long-lived record purely for the teaser bubble's copy on
+       * a FUTURE visit ("still thinking about X?") — independent of
+       * cb_session_v1 itself (which expires in 4h and drives actual
+       * conversation resumption, untouched by this). Only written once the
+       * visitor is at least one level into a real answer, not on every
+       * button click. */
+      if (lead.intent_detail) saveTeaserMemory({ lastTopic: lead.intent_detail, topicSavedAt: Date.now() });
     }
 
     /* Sessions older than this are treated as abandoned/stale rather than
@@ -530,6 +673,7 @@
 
       chatHistory = session.chatHistory || [];
       Object.assign(lead, session.lead || {});
+      Object.assign(tentativeHints, session.tentativeHints || {});
       step = typeof session.step === 'number' ? session.step : step;
       conversationStarted = !!session.conversationStarted;
       transcript = session.transcript;
@@ -565,6 +709,37 @@
     var aiRequestInFlight = false;
     var handleInputInFlight = false;
     var ctaHandled = false;
+
+    /* Delays a qualification step's button group (step-0 re-render, intent
+     * sub-options, budget) by a beat after its question text lands, instead
+     * of dropping a wall of choices on the visitor the instant they finish
+     * reading (or typing). Buttons stay a quick-pick assist, not the
+     * default interaction. The token counter invalidates any earlier
+     * pending reveal the moment a newer one is scheduled (e.g. the user
+     * advanced past this step before the timer fired), and
+     * cancelPendingMcqReveal (called at the top of handleInput) invalidates
+     * it the instant the visitor starts typing instead of clicking, so a
+     * button group never pops in on top of, or right after, an answer
+     * they've already given. */
+    var mcqRevealTimer = null;
+    var mcqRevealToken = 0;
+    /* See cancelTeaserFlow — tracks openFromTeaser's "Yes" branch's own
+     * greeting botReply so a fast follow-up message can preempt it instead
+     * of it firing later and duplicating the greeting. */
+    var pendingGreetingTimer = null;
+    var MCQ_REVEAL_DELAY = 900;
+    function scheduleMcqReveal(renderFn) {
+      clearTimeout(mcqRevealTimer);
+      var token = ++mcqRevealToken;
+      mcqRevealTimer = setTimeout(function () {
+        if (token !== mcqRevealToken) return;
+        renderFn();
+      }, MCQ_REVEAL_DELAY);
+    }
+    function cancelPendingMcqReveal() {
+      clearTimeout(mcqRevealTimer);
+      mcqRevealToken++;
+    }
 
     /* Derive API endpoint from widget.js src — same origin as the widget */
     var API_URL = (function () {
@@ -731,7 +906,7 @@
 
     function botReply(msg, cb, delay) {
       showTyping();
-      setTimeout(function () {
+      return setTimeout(function () {
         hideTyping();
         addBotMsg(msg);
         if (cb) cb();
@@ -1034,6 +1209,134 @@
       return ''; /* correction intent detected, but no field named yet — ask which one */
     }
 
+    /* Merges the AI's [[LEAD_INFO:...]] extraction (see api/chat.js's
+     * formatLeadInfoInstructions) into `lead`, re-validated through the
+     * exact same local checks used everywhere else in this file
+     * (isValidName / digit-length phone check / email regex) — the model's
+     * own judgment is never trusted directly for what gets stored, only
+     * used to notice that something was said. Never overwrites a field
+     * already on file (first value wins, same as every other capture path
+     * here). Called from a single choke point inside askAI, so every
+     * LLM-first path (steps 0-3's stepContext detours, steps 4-6's
+     * shape-gated detours, and plain free chat after lead capture) benefits
+     * without each call site needing its own handling — this is what lets
+     * "I'm Akash, quick question first" fill lead.name immediately instead
+     * of only capturing it once step 4 is reached and asked head-on. */
+    function applyInferredLeadInfo(info) {
+      if (!info) return;
+      var changed = false;
+      if (!lead.name && info.name && isValidName(info.name)) { lead.name = info.name; changed = true; }
+      if (!lead.phone && info.phone && info.phone.replace(/\D/g, '').length >= 7) { lead.phone = info.phone; changed = true; }
+      if (!lead.email && info.email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(info.email)) { lead.email = info.email; changed = true; }
+      /* Company is opportunistic/low-stakes (no scripted step depends on
+       * it, worst case the sales team sees a slightly-off guess) — just a
+       * plausibility check, not full name-grade validation. */
+      if (!lead.company && info.company && info.company.length <= 80 && !looksLikeContactRefusal(info.company)) { lead.company = info.company; changed = true; }
+      /* intent/intentDetail/budget only ever arrive here already at HIGH
+       * confidence (api/chat.js's formatTurnSignalInstructions keeps medium-
+       * confidence guesses out of these keys entirely, see applyTentativeHints
+       * below) — server-validated against the canonical taxonomy already,
+       * re-checked here against the exact same source of truth the rest of
+       * the widget uses (INTENT_OPTIONS/BUDGET_OPTIONS) rather than trusting
+       * the server's copy blindly. intentDetail is only accepted once
+       * lead.intent itself is resolved (possibly by the very line above it,
+       * if both arrived in the same message) and is a genuine member of
+       * THAT intent's own sub-options — a stray intentDetail with no
+       * matching bucket is simply dropped rather than stored orphaned. */
+      if (!lead.intent && info.intent && INTENT_OPTIONS[info.intent]) { lead.intent = info.intent; changed = true; }
+      if (!lead.intent_detail && info.intentDetail && lead.intent && INTENT_OPTIONS[lead.intent] && INTENT_OPTIONS[lead.intent].indexOf(info.intentDetail) > -1) {
+        lead.intent_detail = info.intentDetail; changed = true;
+      }
+      if (!lead.budget && info.budget && BUDGET_OPTIONS.indexOf(info.budget) > -1) { lead.budget = info.budget; changed = true; }
+      if (changed) saveSession();
+    }
+
+    /* Medium-confidence project-type/budget hints (api/chat.js's "don't
+     * lock it in yet" tier) — stored only while the real field is still
+     * open, never trusted as the answer itself. Read back out via
+     * handleInput's step-0/1/2 stepContext (`hint:` key) so the AI can
+     * softly confirm ("sounds like this might lean toward X, is that
+     * right?") instead of either asking cold or silently losing what the
+     * visitor already half-said. Once the real field lands, the hint is
+     * simply never consulted again (every read site already guards on the
+     * field still being unset) — no separate clearing needed. */
+    function applyTentativeHints(hints) {
+      if (!hints) return;
+      if (!lead.intent && hints.intent) tentativeHints.intent = hints.intent;
+      if (!lead.budget && hints.budget) tentativeHints.budget = hints.budget;
+    }
+
+    /* Shared by the step-0/1/2 and "No"-followup detour callbacks below:
+     * when the current question is still genuinely open and the AI's own
+     * reply didn't ask something new (!redirected), the default is now a
+     * plain-text nudge merged into the AI's own bubble, NOT a button wall —
+     * buttons only surface when the AI itself signaled needsOptions (the
+     * visitor asked for options, said "I don't know", seemed stuck, etc.).
+     * Keeps the question visibly alive either way, just without defaulting
+     * to a wall of choices on every single still-open turn. */
+    function resumeStillOpen(aiReply, needsOptions, questionText, showButtonsFn) {
+      if (needsOptions) {
+        showButtonsFn();
+        return;
+      }
+      if (!appendResumeLineToLastBotMsg(aiReply, questionText)) botReply(questionText);
+    }
+
+    /* Re-derives "what qualification info is still missing?" from `lead`
+     * itself and asks exactly that, instead of any caller hardcoding "ask
+     * the next thing in sequence" — the same principle as
+     * advanceFromContactStep below, one level earlier in the flow. A rich
+     * opening message ("I need an ERP for inventory, budget's ~$20k") can
+     * set intent + intent_detail + budget all via applyInferredLeadInfo in
+     * one shot, in which case this correctly skips straight to the notes
+     * step without ever showing the intent/budget MCQs. Step 3 (notes) is
+     * deliberately never auto-skipped here — it stays one always-asked,
+     * low-friction beat between qualification and contact collection. */
+    function advanceQualificationStep() {
+      if (!lead.intent) {
+        step = 0;
+        botReply('What kind of project do you need help bringing to life?', renderStep0Buttons);
+        return;
+      }
+      if (!lead.intent_detail) {
+        step = 1;
+        var followUpMsg = INTENT_DETAIL_FOLLOWUPS[lead.intent] || "Can you tell me a bit about it or if you already have a design in mind?";
+        chatHistory.push({ role: 'assistant', content: followUpMsg });
+        botReply(followUpMsg, function () { showIntentOptions(lead.intent); });
+        return;
+      }
+      if (!lead.budget) {
+        showBudgetStep();
+        return;
+      }
+      showNotesStep();
+    }
+
+    /* Re-derives "what does this lead still need?" and resumes the
+     * conversation accordingly, merging into the AI's own just-rendered
+     * bubble rather than opening a new one (same one-voice convention as
+     * appendResumeLineToLastBotMsg everywhere else in this file). Used from
+     * the steps 4/5/6 detour branches below when the field that step was
+     * about to ask for turns out to already be known — either just captured
+     * by applyInferredLeadInfo from the SAME message that triggered this
+     * detour, or captured earlier in the conversation. Without this, the
+     * widget would ask for a field it already has, which is exactly the
+     * "doesn't remember what I told it" bug this exists to close. */
+    function advanceFromContactStep(aiReply) {
+      if (lead.name && lead.phone && lead.email) {
+        step = 7;
+        var doneLine = "Perfect, I've got everything I need. Based on what you've shared, the best next step is a quick call or Google Meet to go over your project!";
+        if (!appendResumeLineToLastBotMsg(aiReply, doneLine)) botReply(doneLine);
+        showFinalCTA(true);
+        return;
+      }
+      step = !lead.name ? 4 : !lead.phone ? 5 : 6;
+      var nextQ = step === 4 ? "What's your name?" : step === 5 ? "What's the best phone number to reach you?" : "What's the best email address to reach you?";
+      if (!appendResumeLineToLastBotMsg(aiReply, "Whenever you're ready, " + nextQ.charAt(0).toLowerCase() + nextQ.slice(1))) {
+        botReply(nextQ);
+      }
+    }
+
     /* The three resolve*Refusal functions below are each reachable from TWO
      * different triggers: the widget's own local looksLikeContactRefusal()
      * regex/keyword check (fast, free, catches the common/anticipated
@@ -1173,9 +1476,26 @@
         var reply = (data.reply || "I'm having a little trouble right now. Please try again or call us at 406-936-3049.").replace(/—/g, ',');
         chatHistory.push({ role: 'assistant', content: reply });
         addBotMsg(reply);
+        applyInferredLeadInfo(data.leadInfo);
+        applyTentativeHints(data.hints);
         resetIdleTimer();
         setTimeout(function () { inputEl.focus(); }, 100);
-        if (onDone) onDone(reply, data.stepAnswered === true, data.matchedOption || null, data.redirected === true, data.collectContact === true, data.refused === true);
+        /* Centralized "time to collect contact info" check — covers BOTH
+         * the stepContext-gated explicit [[COLLECT_CONTACT]] marker AND the
+         * new always-on, inferred readyForContact signal (see api/chat.js's
+         * formatTurnSignalInstructions), which fires even on paths that
+         * never had a stepContext at all (plain free chat, the very first
+         * typed message). `step < 4` guards this to only ever fire before
+         * contact collection has already started — once inside steps 4-6,
+         * we're already collecting, and readyForContact firing there would
+         * be redundant at best. Individual onDone callbacks below no longer
+         * need their own `if (collectContact)` check, this one covers all
+         * of them; onDone simply never runs on this path. */
+        if ((data.collectContact === true || data.readyForContact === true) && step < 4) {
+          enterContactFlow();
+          return;
+        }
+        if (onDone) onDone(reply, data.stepAnswered === true, data.matchedOption || null, data.redirected === true, data.collectContact === true, data.refused === true, data.needsOptions === true);
       })
       .catch(function () {
         aiRequestInFlight = false;
@@ -1183,7 +1503,7 @@
         inputEl.disabled = false;
         addBotMsg("Sorry, I'm having trouble connecting right now. Please call us at 406-936-3049 or email contact@demskigroup.com.");
         resetIdleTimer();
-        if (onDone) onDone(null, false, null, false, false, false);
+        if (onDone) onDone(null, false, null, false, false, false, false);
       });
     }
 
@@ -1222,6 +1542,36 @@
       scheduleIdleTimer();
     }
 
+    /* The floating idle bubble's message (shown only while the chat window
+     * is closed, see below) — unlike the in-chat reminder text (`idleMsg`
+     * below, left exactly as-is: that's chat transcript content, not the
+     * teaser bubble), this one adapts to how far the conversation actually
+     * got, since `lead`/`step` are both in scope here. Close to done ->
+     * offer to connect with the team; mid-conversation with a known
+     * project type -> reference it by name; otherwise a generic "still
+     * here" nudge. */
+    function pickIdleBubbleMessage() {
+      if (step >= 4 && step < 7) {
+        return pickVaried([
+          "If you'd like, I can connect you with one of our consultants.",
+          "Whenever you're ready, I can get our team looped in."
+        ], 'idle-almost-done');
+      }
+      var topic = lead.intent_detail || lead.intent;
+      if (topic) {
+        return pickVaried([
+          'Still thinking about ' + topic + '?',
+          'We were discussing your ' + topic + ', happy to keep going.',
+          'Ready to continue whenever you are.'
+        ], 'idle-topic');
+      }
+      return pickVaried([
+        "Still there? No rush, I'm here if you need anything.",
+        "Feel free to ask anything, I'm around.",
+        "If you'd like help with anything else, I'm here."
+      ], 'idle-generic');
+    }
+
     /* Fires at most ONCE per session, and never while the user is actively
      * engaged: input focused, or chat freshly interacted with (the timer
      * is restarted from scratch by resetIdleTimer on every interaction, so
@@ -1252,7 +1602,7 @@
           setTimeout(function () { idleLauncher.classList.remove('cb-shake'); }, 2000);
         }
         playNotification();
-        showIdleBubble(idleMsg);
+        showIdleBubble(pickIdleBubbleMessage());
       }
 
       removeIdleReminder();
@@ -1407,7 +1757,7 @@
       if (expanded || teaserFlowDone || document.getElementById('cb-greeting-bubble')) return;
       var b = document.createElement('div'); b.id = 'cb-greeting-bubble'; b.className = 'cb-teaser-bubble';
       b.innerHTML =
-        '<p id="cb-bopen">Hey! Do you have any questions?</p>' +
+        '<p id="cb-bopen">' + escapeHtml(pickTeaserMessage()) + '</p>' +
         '<img class="cb-bubble-av" src="' + AVATAR_URL + '" alt="' + BOT_NAME + '" onerror="this.src=\'' + AVATAR_FB + '\'" />' +
         '<span class="cb-bubble-close" id="cb-bclose">&#x00D7;</span>';
       document.body.appendChild(b);
@@ -1442,7 +1792,7 @@
       dismissIdleBubble();
       var b = document.createElement('div'); b.id = IDLE_BUBBLE_ID; b.className = 'cb-teaser-bubble';
       b.innerHTML =
-        '<p id="cb-ibopen">' + text + '</p>' +
+        '<p id="cb-ibopen">' + escapeHtml(text) + '</p>' +
         '<img class="cb-bubble-av" src="' + AVATAR_URL + '" alt="' + BOT_NAME + '" onerror="this.src=\'' + AVATAR_FB + '\'" />' +
         '<span class="cb-bubble-close" id="cb-ibclose">&#x00D7;</span>';
       document.body.appendChild(b);
@@ -1509,6 +1859,14 @@
       if (cardTimer)  { clearTimeout(cardTimer);  cardTimer  = null; }
       if (bubbleTimer) { clearTimeout(bubbleTimer); bubbleTimer = null; }
       if (badgeTimer)  { clearTimeout(badgeTimer);  badgeTimer  = null; }
+      /* openFromTeaser's "Yes" branch schedules its own greeting botReply
+       * (typing delay + the message itself) — if the visitor types a
+       * detour message before that timer fires, it must not go on to fire
+       * anyway afterward and duplicate the greeting on top of whatever the
+       * detour already rendered. Every path that calls cancelTeaserFlow
+       * (every real user interaction, via addUserMsg/handleInput) also
+       * preempts this. */
+      if (pendingGreetingTimer) { clearTimeout(pendingGreetingTimer); pendingGreetingTimer = null; }
       var badge = document.getElementById('cb-launcher-badge');
       if (badge) badge.classList.remove('cb-badge-on');
     }
@@ -1531,11 +1889,26 @@
               showNoFollowUp();
             } else if (prefillText === 'Yes') {
               expandUI();
-              botReply('What kind of project do you need help bringing to life?', function () {
+              pendingGreetingTimer = botReply('What kind of project do you need help bringing to life?', function () {
+                pendingGreetingTimer = null;
                 renderStep0Buttons();
               });
             } else {
-              askAI(prefillText, false);
+              /* The very first message ever, typed straight into the
+               * greeting card before any step/stepContext exists — a rich
+               * one-shot answer here ("I need an ERP for inventory, ~20k
+               * budget, I'm Akash...") can set intent/intent_detail/budget
+               * (and contact fields) via applyInferredLeadInfo inside
+               * askAI, same as any other detour. Without this callback
+               * nothing would ever move the conversation past step 0
+               * afterward — the bot would answer and then just sit there. */
+              askAI(prefillText, false, function (reply, stepAnswered, matchedOption, redirected, collectContact, refused, needsOptions) {
+                if (lead.intent) {
+                  advanceQualificationStep();
+                } else if (!redirected) {
+                  resumeStillOpen(reply, needsOptions, 'What kind of project do you need help bringing to life?', renderStep0Buttons);
+                }
+              });
             }
           }, 500);
         }
@@ -1678,12 +2051,14 @@
      * entry point into step 0 stays MCQ-first instead of free text. */
     function renderStep0Buttons() {
       var old = document.getElementById('cb-step1'); if (old) old.remove();
-      var s1 = document.createElement('div'); s1.className = 'cb-qbtns cb-grid'; s1.id = 'cb-step1';
-      ['New startup or app idea', 'Software for my business', 'Digital marketing help', 'Just exploring'].forEach(function (v) {
-        var b = document.createElement('button'); b.textContent = v;
-        b.onclick = function () { step1Handler(v); }; s1.appendChild(b);
+      scheduleMcqReveal(function () {
+        var s1 = document.createElement('div'); s1.className = 'cb-qbtns cb-grid'; s1.id = 'cb-step1';
+        ['New startup or app idea', 'Software for my business', 'Digital marketing help', 'Just exploring'].forEach(function (v) {
+          var b = document.createElement('button'); b.textContent = v;
+          b.onclick = function () { step1Handler(v); }; s1.appendChild(b);
+        });
+        msgs.appendChild(s1); scrollToLatestBotMsg();
       });
-      msgs.appendChild(s1); scrollToLatestBotMsg();
     }
 
     /* ── STEP 1: Intent ── */
@@ -1692,56 +2067,58 @@
       var s1 = document.getElementById('cb-step1'); if (s1) s1.remove();
       if (!skipUserMsg) addUserMsg(val);
       chatHistory.push({ role: 'user', content: val });
-      lead.intent = val; step = 1; resetIdleTimer();
-      var followUp = {
-        'New startup or app idea':  'Love it! Tell me more, what kind of app or product are you thinking about?',
-        'Software for my business': 'Great! What problem are you trying to solve in your business?',
-        'Digital marketing help':   'Nice! What are you hoping to improve: traffic, leads, or sales?',
-        'Just exploring':           "That's totally fine! Can you tell me a bit about what you have in mind?"
-      };
-      var followUpMsg = followUp[val] || "Can you tell me a bit about it or if you already have a design in mind?";
-      chatHistory.push({ role: 'assistant', content: followUpMsg });
-      botReply(followUpMsg, function () {
-        showIntentOptions(val);
-      });
+      lead.intent = val; resetIdleTimer();
+      /* advanceQualificationStep re-derives the next question from `lead`
+       * itself rather than hardcoding "always ask intent-detail next" — a
+       * rich message can set intent_detail (or even budget) in the same
+       * turn via applyInferredLeadInfo, in which case this correctly skips
+       * straight past the question that answer already covered. */
+      advanceQualificationStep();
     }
 
     /* ── INTENT OPTIONS ── */
     function showIntentOptions(intent) {
-      var opts = INTENT_OPTIONS[intent] || ['Mobile App', 'Web App', 'Something else'];
       var oldIntent = document.getElementById('cb-intent'); if (oldIntent) oldIntent.remove();
-      var div = document.createElement('div'); div.className = 'cb-qbtns cb-grid'; div.id = 'cb-intent';
-      opts.forEach(function (o) {
-        var b = document.createElement('button'); b.textContent = o;
-        b.onclick = function () {
-          var el = document.getElementById('cb-intent'); if (el) el.remove();
-          addUserMsg(o); lead.intent_detail = o;
-          chatHistory.push({ role: 'user', content: o });
-          step = 2;
-          showBudgetStep();
-        };
-        div.appendChild(b);
-      });
-      div.appendChild(makeBackBtn('Back', function () {
-        var el = document.getElementById('cb-intent'); if (el) el.remove();
-        lead.intent = ''; step = 0;
-        botReply('No problem! What kind of project do you need help bringing to life?', function () {
-          renderStep0Buttons();
+      scheduleMcqReveal(function () {
+        var opts = INTENT_OPTIONS[intent] || ['Mobile App', 'Web App', 'Something else'];
+        var div = document.createElement('div'); div.className = 'cb-qbtns cb-grid'; div.id = 'cb-intent';
+        opts.forEach(function (o) {
+          var b = document.createElement('button'); b.textContent = o;
+          b.onclick = function () {
+            var el = document.getElementById('cb-intent'); if (el) el.remove();
+            addUserMsg(o); lead.intent_detail = o;
+            chatHistory.push({ role: 'user', content: o });
+            step = 2;
+            showBudgetStep();
+          };
+          div.appendChild(b);
         });
-      }));
-      msgs.appendChild(div); scrollToLatestBotMsg();
+        div.appendChild(makeBackBtn('Back', function () {
+          var el = document.getElementById('cb-intent'); if (el) el.remove();
+          lead.intent = ''; step = 0;
+          botReply('No problem! What kind of project do you need help bringing to life?', function () {
+            renderStep0Buttons();
+          });
+        }));
+        msgs.appendChild(div); scrollToLatestBotMsg();
+      });
     }
 
     /* ── BUDGET ── */
-    function showBudgetStep() {
-      step = 2; resetIdleTimer();
-      chatHistory.push({ role: 'assistant', content: 'Do you have a budget range in mind for this project?' });
-      botReply('Do you have a budget range in mind for this project?', function () {
-        showInputBar();
-        inputEl.placeholder = 'Type your answer...';
-        var oldBudget = document.getElementById('cb-budget'); if (oldBudget) oldBudget.remove();
+    /* Includes a one-clause "why I'm asking" so the question doesn't land
+     * cold — a visitor has no reason to volunteer budget to a stranger
+     * unless it's obvious it changes how their project gets approached. */
+    var BUDGET_QUESTION = "Roughly what budget range are you working with? I ask because a $10k project and a $500k platform get planned very differently, so it helps me point you toward the right approach.";
+
+    /* Bare button renderer, mirroring renderStep0Buttons/showIntentOptions —
+     * callable on its own (from the "still open" detour resume below) so
+     * budget's quick-pick buttons can be offered without re-asking the
+     * question in a fresh bubble. */
+    function renderBudgetButtons() {
+      var oldBudget = document.getElementById('cb-budget'); if (oldBudget) oldBudget.remove();
+      scheduleMcqReveal(function () {
         var div = document.createElement('div'); div.className = 'cb-bbtns cb-grid'; div.id = 'cb-budget';
-        ['Under $10k', '$10k - $25k', '$25k - $50k', '$50k+', 'Not sure yet'].forEach(function (bv) {
+        BUDGET_OPTIONS.forEach(function (bv) {
           var btn = document.createElement('button'); btn.textContent = bv;
           btn.onclick = function () {
             var el = document.getElementById('cb-budget'); if (el) el.remove();
@@ -1756,6 +2133,16 @@
           lead.budget = ''; step = 1; showIntentOptions(lead.intent);
         }));
         msgs.appendChild(div); scrollToLatestBotMsg();
+      });
+    }
+
+    function showBudgetStep() {
+      step = 2; resetIdleTimer();
+      chatHistory.push({ role: 'assistant', content: BUDGET_QUESTION });
+      botReply(BUDGET_QUESTION, function () {
+        showInputBar();
+        inputEl.placeholder = 'Type your answer...';
+        renderBudgetButtons();
       });
     }
 
@@ -1907,7 +2294,7 @@
         intent: lead.intent, intent_detail: lead.intent_detail,
         budget: lead.budget,
         project_notes: lead.project_notes,
-        name: lead.name, phone: lead.phone, email: lead.email, cta_choice: lead.cta_choice,
+        name: lead.name, phone: lead.phone, email: lead.email, company: lead.company, cta_choice: lead.cta_choice,
         page: lead.page, page_name: lead.page_name,
         utm_source: lead.utm_source, utm_campaign: lead.utm_campaign,
         utm_medium: lead.utm_medium, utm_term: lead.utm_term,
@@ -1947,6 +2334,7 @@
       setTimeout(function () { handleInputInFlight = false; }, 0);
       inputEl.value = '';
       cancelTeaserFlow();
+      cancelPendingMcqReveal();
       addUserMsg(val); resetIdleTimer();
 
       /* LLM-first: every typed message on an MCQ step is sent straight to
@@ -1964,38 +2352,40 @@
         var nfLocalMatch = localExactOptionMatch(val, NO_FOLLOWUP_OPTS);
         if (nfLocalMatch) { noFollowUpDiv.remove(); selectNoFollowUp(nfLocalMatch); return; }
         noFollowUpDiv.remove();
-        askAI(val, false, function (reply, stepAnswered, matchedOption, redirected, collectContact) {
-          if (collectContact) {
-            enterContactFlow();
-          } else if (stepAnswered) {
+        askAI(val, false, function (reply, stepAnswered, matchedOption, redirected, collectContact, refused, needsOptions) {
+          if (stepAnswered) {
             selectNoFollowUp(matchedOption || val);
           } else if (!redirected) {
-            renderNoFollowUpButtons();
+            resumeStillOpen(reply, needsOptions, "What's one thing in your business that feels harder than it should be?", renderNoFollowUpButtons);
           }
           /* redirected: the AI's own reply already asked something new and
            * specific (e.g. for a name) — show no buttons, just wait for the
            * next typed message instead of stacking a second question.
-           * collectContact: the user asked to be connected with the team —
-           * hand off to the widget's own validated contact flow instead of
-           * letting the AI free-collect name/phone/email itself, so a lead
-           * already on file from an earlier pass is never re-asked. */
+           * collectContact/readyForContact are handled centrally inside
+           * askAI's own response handler (before this callback ever runs),
+           * which hands off to enterContactFlow() itself in that case. */
         }, { question: "What's one thing in your business that feels harder than it should be?", options: NO_FOLLOWUP_OPTS });
         return;
       }
 
       if (step === 0) {
+        var s1existing = document.getElementById('cb-step1'); if (s1existing) s1existing.remove();
         var step0Opts = ['New startup or app idea', 'Software for my business', 'Digital marketing help', 'Just exploring'];
         var step0LocalMatch = localExactOptionMatch(val, step0Opts);
         if (step0LocalMatch) { step1Handler(step0LocalMatch, true); return; }
-        askAI(val, false, function (reply, stepAnswered, matchedOption, redirected, collectContact) {
-          if (collectContact) {
-            enterContactFlow();
-          } else if (stepAnswered) {
+        askAI(val, false, function (reply, stepAnswered, matchedOption, redirected, collectContact, refused, needsOptions) {
+          if (stepAnswered) {
             step1Handler(matchedOption || val, true);
+          } else if (lead.intent) {
+            /* Inference (applyInferredLeadInfo, run inside askAI before this
+             * callback fires) independently set intent — resume wherever
+             * the qualification flow should now be instead of asking for
+             * something we already have. */
+            advanceQualificationStep();
           } else if (!redirected) {
-            renderStep0Buttons();
+            resumeStillOpen(reply, needsOptions, 'What kind of project do you need help bringing to life?', renderStep0Buttons);
           }
-        }, { question: 'What kind of project do you need help bringing to life?', options: step0Opts });
+        }, { question: 'What kind of project do you need help bringing to life?', options: step0Opts, hint: tentativeHints.intent || undefined });
         return;
       }
 
@@ -2003,33 +2393,33 @@
         var el = document.getElementById('cb-intent'); if (el) el.remove();
         var intentDetailOpts = INTENT_OPTIONS[lead.intent] || ['Mobile App', 'Web App', 'Something else'];
         var step1LocalMatch = localExactOptionMatch(val, intentDetailOpts);
-        if (step1LocalMatch) { lead.intent_detail = step1LocalMatch; step = 2; chatHistory.push({ role: 'user', content: val }); showBudgetStep(); return; }
-        askAI(val, false, function (reply, stepAnswered, matchedOption, redirected, collectContact) {
-          if (collectContact) {
-            enterContactFlow();
-          } else if (stepAnswered) {
-            lead.intent_detail = matchedOption || val; step = 2; showBudgetStep();
+        if (step1LocalMatch) { lead.intent_detail = step1LocalMatch; chatHistory.push({ role: 'user', content: val }); advanceQualificationStep(); return; }
+        askAI(val, false, function (reply, stepAnswered, matchedOption, redirected, collectContact, refused, needsOptions) {
+          if (stepAnswered) {
+            lead.intent_detail = matchedOption || val; advanceQualificationStep();
+          } else if (lead.intent_detail || lead.budget) {
+            advanceQualificationStep();
           } else if (!redirected) {
-            showIntentOptions(lead.intent);
+            resumeStillOpen(reply, needsOptions, 'Can you tell me a bit more about what kind of ' + (lead.intent || 'project') + ' you need?', function () { showIntentOptions(lead.intent); });
           }
-        }, { question: 'Can you tell me a bit more about what kind of ' + (lead.intent || 'project') + ' you need?', options: intentDetailOpts });
+        }, { question: 'Can you tell me a bit more about what kind of ' + (lead.intent || 'project') + ' you need?', options: intentDetailOpts, hint: tentativeHints.intent || undefined });
         return;
       }
 
       if (step === 2) {
         var elB = document.getElementById('cb-budget'); if (elB) elB.remove();
-        var budgetOpts = ['Under $10k', '$10k - $25k', '$25k - $50k', '$50k+', 'Not sure yet'];
+        var budgetOpts = BUDGET_OPTIONS;
         var step2LocalMatch = localExactOptionMatch(val, budgetOpts);
         if (step2LocalMatch) { lead.budget = step2LocalMatch; chatHistory.push({ role: 'user', content: val }); showNotesStep(); return; }
-        askAI(val, false, function (reply, stepAnswered, matchedOption, redirected, collectContact) {
-          if (collectContact) {
-            enterContactFlow();
-          } else if (stepAnswered) {
+        askAI(val, false, function (reply, stepAnswered, matchedOption, redirected, collectContact, refused, needsOptions) {
+          if (stepAnswered) {
             lead.budget = matchedOption || val; showNotesStep();
+          } else if (lead.budget) {
+            showNotesStep();
           } else if (!redirected) {
-            showBudgetStep();
+            resumeStillOpen(reply, needsOptions, BUDGET_QUESTION, renderBudgetButtons);
           }
-        }, { question: 'Do you have a budget range in mind for this project?', options: budgetOpts });
+        }, { question: BUDGET_QUESTION, options: budgetOpts, hint: tentativeHints.budget || undefined });
         return;
       }
 
@@ -2113,6 +2503,12 @@
         askAI(val, false, function (reply, stepAnswered, matchedOption, redirected, collectContact, refused) {
           if (reply === null) return; /* error path already showed a message */
           if (refused) { resolveNameRefusal(reply); return; }
+          /* The name may have been volunteered inside this very detour
+           * message (e.g. "I'm Akash, quick question first...") and already
+           * captured by applyInferredLeadInfo inside askAI, above — resume
+           * with whatever's still actually needed instead of asking for a
+           * name we already have. */
+          if (lead.name) { advanceFromContactStep(reply); return; }
           if (!appendResumeLineToLastBotMsg(reply, "Whenever you're ready, what's your name?")) {
             botReply("For now: What's your name?");
           }
@@ -2144,6 +2540,7 @@
         askAI(val, false, function (reply, stepAnswered, matchedOption, redirected, collectContact, refused) {
           if (reply === null) return;
           if (refused) { resolvePhoneRefusal(reply); return; }
+          if (lead.phone) { advanceFromContactStep(reply); return; }
           appendResumeLineToLastBotMsg(reply, "Whenever you're ready, what's the best phone number to reach you?");
         }, { question: "What's the best phone number to reach you?" });
         return;
@@ -2164,6 +2561,7 @@
         askAI(val, false, function (reply, stepAnswered, matchedOption, redirected, collectContact, refused) {
           if (reply === null) return;
           if (refused) { resolveEmailRefusal(reply); return; }
+          if (lead.email) { advanceFromContactStep(reply); return; }
           appendResumeLineToLastBotMsg(reply, "Whenever you're ready, what's the best email address to reach you?");
         }, { question: "What's the best email address to reach you?" });
         return;
@@ -2182,7 +2580,7 @@
           botReply("That's completely fine. We usually ask for a name so our team knows who they're speaking with. If you'd prefer not to share it, you can provide a first name, nickname, or business name instead.");
           return; /* stays on step 4 — never advances to phone on an invalid/refused name */
         }
-        lead.name = val; step = 5;
+        lead.name = val;
         /* Pushed into chatHistory (not just lead.name) so the AI actually
          * has this fact available on every later request — without this,
          * the model has no way to know the user's name even though the
@@ -2190,18 +2588,40 @@
          * have any information about you" bug when later asked "do you
          * know me?". Same reasoning applies to phone/email/notes below. */
         chatHistory.push({ role: 'user', content: val });
-        var nameReply = 'Nice to meet you, ' + val + '! What\'s the best phone number to reach you?';
-        chatHistory.push({ role: 'assistant', content: nameReply });
-        botReply(nameReply); return;
+        /* Phone/email may already be on file from an earlier detour that
+         * volunteered them (applyInferredLeadInfo) — ask only whatever's
+         * actually still missing instead of always assuming phone is next. */
+        if (lead.phone && lead.email) {
+          step = 7;
+          var nameReplyDone = 'Nice to meet you, ' + val + "! I've already got the rest of your details, let's get you booked in.";
+          chatHistory.push({ role: 'assistant', content: nameReplyDone });
+          botReply(nameReplyDone, function () { showFinalCTA(true); });
+        } else {
+          step = lead.phone ? 6 : 5;
+          var nextQ = lead.phone ? "What's the best email address to reach you?" : "What's the best phone number to reach you?";
+          var nameReply = 'Nice to meet you, ' + val + '! ' + nextQ;
+          chatHistory.push({ role: 'assistant', content: nameReply });
+          botReply(nameReply);
+        }
+        return;
       }
       if (step === 5) {
         var digits = val.replace(/\D/g, '');
         if (digits.length < 7) { botReply("That doesn't look like a valid phone number. Could you double-check?"); return; }
-        lead.phone = val; step = 6;
+        lead.phone = val;
         chatHistory.push({ role: 'user', content: val });
-        var phoneReply = "Got it! And what's the best email address to reach you?";
-        chatHistory.push({ role: 'assistant', content: phoneReply });
-        botReply(phoneReply); return;
+        if (lead.email) {
+          step = 7;
+          var phoneReplyDone = "Got it! I've already got your email on file too, let's get you booked in.";
+          chatHistory.push({ role: 'assistant', content: phoneReplyDone });
+          botReply(phoneReplyDone, function () { showFinalCTA(true); });
+        } else {
+          step = 6;
+          var phoneReply = "Got it! And what's the best email address to reach you?";
+          chatHistory.push({ role: 'assistant', content: phoneReply });
+          botReply(phoneReply);
+        }
+        return;
       }
       if (step === 6) {
         if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(val)) { botReply("That doesn't look right. Could you double-check your email address?"); return; }
